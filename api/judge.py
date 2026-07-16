@@ -318,7 +318,21 @@ def judge(target, bars=None):
 # ===== HTTPハンドラ (Vercel) =====
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        q = parse_qs(urlparse(self.path).query)
+        parsed = urlparse(self.path)
+        # /api/ 以外のパスは判定画面(HTML)を返す
+        if not parsed.path.startswith("/api"):
+            try:
+                from .page import HTML
+            except ImportError:
+                from page import HTML
+            body = HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "public, max-age=300")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        q = parse_qs(parsed.query)
         try:
             if "date" in q:
                 target = dt.date(*map(int, q["date"][0].split("-")))
