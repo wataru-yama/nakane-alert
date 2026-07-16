@@ -1,0 +1,6 @@
+{
+  "regions": ["hnd1"],
+  "functions": {
+    "api/judge.py": { "maxDuration": 30 }
+  }
+}
