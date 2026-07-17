@@ -80,6 +80,23 @@ async function run() {
     const r = await fetch("/api/judge?date=" + dateEl.value);
     const d = await r.json();
     if (d.error) { out.innerHTML = `<div class="err">エラー: ${d.error}</div>`; return; }
+    // ゴトー日: 3バリアント表示
+    if (d.variants) {
+      let h = `<div class="card"><div class="daytype">${d.date}（${d.dow}） — ${d.day_type}</div>` +
+              `<div class="logic">${d.logic}</div></div>`;
+      d.variants.forEach(v => {
+        h += `<div class="card"><div class="logic" style="font-size:.98rem">${v.name}</div>` +
+             `<div class="plan">${v.plan}</div>` +
+             `<div><span class="tier ${tierClass(v.tier)}" style="font-size:1.2rem">${v.tier}</span></div>` +
+             (v.prob !== undefined ? `<div class="score">モデル確率 ${v.prob}</div>` : "") +
+             `<div class="detail">${v.detail}</div>`;
+        (v.warnings ?? []).forEach(w => h += `<div class="warn">⚠ ${w}</div>`);
+        if (v.price) h += `<div class="meta">BID ${v.price.bid} / ASK ${v.price.ask} ・ 最終バー ${v.data_last_bar ?? "-"} JST</div>`;
+        h += `</div>`;
+      });
+      h += `<div class="card"><div class="meta">判定生成 ${d.generated_at}</div></div>`;
+      out.innerHTML = h; return;
+    }
     let h = `<div class="card">`;
     h += `<div class="daytype">${d.date}（${d.dow}） — ${d.day_type ?? ""}</div>`;
     if (!d.logic) {

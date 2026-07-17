@@ -1,16 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Vercel Serverless Function: 仲値3ロジック GO/NO-GO判定 (USDJPY)
+Vercel Serverless Function: 仲値3ロジック GO/NO-GO判定
 データソース: GMOコイン 外国為替FX 公開API (認証不要)
-  https://forex-api.coin.z.com/public/v1/klines
 GET /api/judge?date=YYYY-MM-DD  (省略時=今日JST)
-依存: jpholiday のみ (requirements.txt)
+
+ロジック:
+  L1 ゴトー日 9:53ショート 3バリアント
+    L1a: USDJPY SL10/TP15/15分  (高PF・低DD)
+    L1b: USDJPY SL10/TP15/30分  (高pips, 4/6/8月除外オプション)
+    L1c: EURJPY SL15/TP15/60分  (最高pips)
+  L2 非ゴトー日(火水金) USDJPY 9:25ロング → 9:55決済
+  L3 祝日 USDJPY 9:00ショート → 9:55決済
 """
 import calendar
 import concurrent.futures
 import datetime as dt
 import json
 import math
+import os
 import urllib.request
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -18,19 +25,23 @@ from urllib.parse import urlparse, parse_qs
 import jpholiday
 
 JST = dt.timezone(dt.timedelta(hours=9))
-API = "https://forex-api.coin.z.com/public/v1/klines?symbol=USD_JPY&priceType={pt}&interval={iv}&date={d}"
+API = "https://forex-api.coin.z.com/public/v1/klines?symbol={sym}&priceType={pt}&interval={iv}&date={d}"
 
-# ===== L1 ロジスティック回帰パラメータ (全期間797トレードで学習; l1_model.json と同一) =====
-L1_FEATURES = ["n_gap", "n_prevret", "n_ret79", "n_range79", "n_vol79",
-               "n_ret5d", "spread_entry", "pos_prev_range", "n_ret9T", "n_range9T"]
-L1_MODEL = None  # 起動時に同梱JSONから読み込み
-import os
 _here = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(_here, "l1_model.json")) as _f:
-    L1_MODEL = json.load(_f)
+with open(os.path.join(_here, "l1_models.json")) as _f:
+    L1_MODELS = json.load(_f)
+
+L1_VARIANTS = [
+    {"key": "L1a", "symbol": "USD_JPY", "name": "L1a USDJPY ショート（SL10/TP15/15分）",
+     "plan": "9:53 成行ショート / SL10・TP15・タイムアウト15分(10:08)", "month_excl": True},
+    {"key": "L1b", "symbol": "USD_JPY", "name": "L1b USDJPY ショート（SL10/TP15/30分）",
+     "plan": "9:53 成行ショート / SL10・TP15・タイムアウト30分(10:23)", "month_excl": True},
+    {"key": "L1c", "symbol": "EUR_JPY", "name": "L1c EURJPY ショート（SL15/TP15/60分）",
+     "plan": "9:53 成行ショート / SL15・TP15・タイムアウト60分(10:53)", "month_excl": False},
+]
 
 
-# ===== カレンダー判定 (nakane_alert.py と同一) =====
+# ===== カレンダー判定 =====
 def is_jp_banking_day(d):
     if d.weekday() >= 5 or jpholiday.is_holiday(d):
         return False
@@ -71,8 +82,8 @@ def is_trade_holiday(d):
 
 
 # ===== データ取得 =====
-def fetch_klines(biz_date, interval, price_type, timeout=8):
-    url = API.format(pt=price_type, iv=interval, d=biz_date.strftime("%Y%m%d"))
+def fetch_klines(symbol, biz_date, interval, price_type, timeout=8):
+    url = API.format(sym=symbol, pt=price_type, iv=interval, d=biz_date.strftime("%Y%m%d"))
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "nakane-alert/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -84,11 +95,10 @@ def fetch_klines(biz_date, interval, price_type, timeout=8):
         return []
 
 
-def load_bars(target, lookback=16):
-    """target日以前の1分足(当日)+15分足(過去)をJSTカレンダー日でバケット化。
-    返値: bars[date_iso] = list of dict(t="HH:MM:SS", ob,hb,lb,cb, oa,ha,la,ca)"""
+def load_bars(target, symbol, lookback=16):
+    """JSTカレンダー日ごとのBID/ASKバー辞書を返す"""
     biz_dates = [target - dt.timedelta(days=i) for i in range(lookback, -1, -1)]
-    biz_dates = [d for d in biz_dates if d.weekday() < 6]  # 日曜はファイルなし
+    biz_dates = [d for d in biz_dates if d.weekday() < 6]
     jobs = []
     for d in biz_dates:
         iv = "1min" if (target - d).days <= 1 else "15min"
@@ -96,12 +106,11 @@ def load_bars(target, lookback=16):
         jobs.append((d, iv, "ASK"))
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
-        futs = {ex.submit(fetch_klines, d, iv, pt): (d, iv, pt) for d, iv, pt in jobs}
+        futs = {ex.submit(fetch_klines, symbol, d, iv, pt): (d, iv, pt) for d, iv, pt in jobs}
         for fu in concurrent.futures.as_completed(futs):
             results[futs[fu]] = fu.result()
-    # openTimeでBID/ASKを結合し、JSTカレンダー日でバケット
     bars = {}
-    for d, iv, _ in {(d, iv, "BID"): 1 for d, iv, pt in jobs}.keys():
+    for d, iv, _pt in {(d, iv, "BID"): 1 for d, iv, pt in jobs}.keys():
         bid = {b["openTime"]: b for b in results.get((d, iv, "BID"), [])}
         ask = {b["openTime"]: b for b in results.get((d, iv, "ASK"), [])}
         for ts, b in bid.items():
@@ -109,8 +118,7 @@ def load_bars(target, lookback=16):
             if not a:
                 continue
             t = dt.datetime.fromtimestamp(int(ts) / 1000, tz=JST)
-            key = t.date().isoformat()
-            bars.setdefault(key, []).append({
+            bars.setdefault(t.date().isoformat(), []).append({
                 "t": t.strftime("%H:%M:%S"),
                 "ob": float(b["open"]), "hb": float(b["high"]),
                 "lb": float(b["low"]), "cb": float(b["close"]),
@@ -121,7 +129,7 @@ def load_bars(target, lookback=16):
     return bars
 
 
-# ===== 特徴量 (nakane_alert.py と同一定義) =====
+# ===== 特徴量 =====
 def mid(b, k):
     return (b[k + "b"] + b[k + "a"]) / 2
 
@@ -213,8 +221,13 @@ def compute_features(bars, target_iso, entry_t):
 
 
 # ===== 判定 =====
-def judge_l1(f):
-    m = L1_MODEL
+def _clean(f):
+    return {k: (None if isinstance(v, float) and math.isnan(v) else round(v, 4))
+            for k, v in f.items() if k != "last_bar"}
+
+
+def judge_l1_variant(var, f, month):
+    m = L1_MODELS[var["key"]]
     z = 0.0
     for k, mu, sd, c in zip(m["features"], m["scaler_mean"], m["scaler_scale"], m["coef"]):
         v = f.get(k, 0.0)
@@ -222,15 +235,26 @@ def judge_l1(f):
             v = 0.0
         z += (v - mu) / sd * c
     p = 1 / (1 + math.exp(-(z + m["intercept"])))
-    if p >= m["q75"]:
-        tier, note = "STRONG GO", "WF-OOS実績: 勝率61.1% / +3.13pips/回 / PF2.24"
-    elif p >= m["q50"]:
-        tier, note = "GO", "WF-OOS実績: 勝率61.6% / +2.72pips/回 / PF2.07"
-    elif p >= m["q25"]:
-        tier, note = "WEAK", "WF-OOS実績: 勝率54.4% / +1.61pips/回 — 小ロットか見送り推奨"
-    else:
-        tier, note = "NO-GO", "WF-OOS実績: 勝率46.3% / +0.25pips/回 — エッジ消失域"
-    return tier, round(p, 4), note
+    tier_key = ("STRONG" if p >= m["q75"] else "GO" if p >= m["q50"]
+                else "WEAK" if p >= m["q25"] else "NOGO")
+    s = m["tier_stats"][tier_key]
+    tier_label = {"STRONG": "STRONG GO", "GO": "GO", "WEAK": "WEAK", "NOGO": "NO-GO"}[tier_key]
+    note = f"WF-OOS実績: 勝率{s['wr']}% / {s['mp']:+}pips/回 / PF{s['pf']} (n={s['n']})"
+    if tier_key == "WEAK":
+        note += " — 小ロットか見送り推奨"
+    v = {"key": var["key"], "name": var["name"], "plan": var["plan"],
+         "tier": tier_label, "prob": round(p, 4), "detail": note,
+         "warnings": [], "features": _clean(f),
+         "price": {"bid": f["entry_bid"], "ask": f["entry_ask"]},
+         "data_last_bar": f["last_bar"]}
+    if f["n_bars_9T"] < 45:
+        v["warnings"].append(f"9:00-9:53のバー数 {f['n_bars_9T']}/53 — 9:52以降に再判定推奨")
+    sp_lim = 0.4 if var["symbol"] == "USD_JPY" else 0.9
+    if f["spread_entry"] > sp_lim:
+        v["warnings"].append(f"スプレッド {f['spread_entry']:.2f}pips > {sp_lim}（コスト増に注意）")
+    if var["month_excl"] and month in (4, 6, 8):
+        v["warnings"].append("4/6/8月はUSDJPYで月除外設定によりPF改善の報告あり（除外採用中なら見送り）")
+    return v
 
 
 def judge_l2(f, dow):
@@ -260,8 +284,8 @@ def judge_l3(f):
     return tier, score, note, sig
 
 
-def judge(target, bars=None):
-    """メイン判定。barsを渡すとAPI取得をスキップ(テスト用)"""
+def judge(target, bars_usd=None, bars_eur=None):
+    """メイン判定。bars_*を渡すとAPI取得をスキップ(テスト用)"""
     dow = target.weekday()
     res = {"date": target.isoformat(), "dow": "月火水木金土日"[dow],
            "generated_at": dt.datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST"),
@@ -271,14 +295,14 @@ def judge(target, bars=None):
         return res
     holiday = is_trade_holiday(target)
     gotobi = is_gotobi(target)
-    if bars is None:
-        bars = load_bars(target)
     ti = target.isoformat()
 
     if holiday:
-        f = compute_features(bars, ti, "09:00:00")
+        if bars_usd is None:
+            bars_usd = load_bars(target, "USD_JPY")
+        f = compute_features(bars_usd, ti, "09:00:00")
         res["day_type"] = f"祝日（{jpholiday.is_holiday_name(target)}）"
-        res["logic"] = "L3 祝日仲値ショート"
+        res["logic"] = "L3 祝日仲値ショート (USDJPY)"
         res["plan"] = "9:00 成行ショート → 9:55 決済（災害用SL 30pips）"
         if f["spread_entry"] >= 5:
             res.update(tier="NO-GO", detail=f"スプレッド{f['spread_entry']:.1f}pips = 実質取引不能")
@@ -288,28 +312,46 @@ def judge(target, bars=None):
                        signals={k: bool(v) for k, v in sig.items()})
             if f["spread_entry"] > 1:
                 res["warnings"].append(f"スプレッド拡大 {f['spread_entry']:.1f}pips（流動性低下）")
-    elif gotobi:
-        f = compute_features(bars, ti, "09:53:00")
+        res["features"] = _clean(f)
+        res["data_last_bar"] = f["last_bar"]
+        res["price"] = {"bid": f["entry_bid"], "ask": f["entry_ask"]}
+        return res
+
+    if gotobi:
         res["day_type"] = "ゴトー日"
-        res["logic"] = "L1 ゴトー日仲値ショート"
-        res["plan"] = "9:53 成行ショート / SL10・TP15・15分タイムアウト"
-        tier, p, note = judge_l1(f)
-        res.update(tier=tier, score=f"モデル確率 {p}", detail=note)
-        if f["n_bars_9T"] < 45:
-            res["warnings"].append(f"9:00-9:53のバー数 {f['n_bars_9T']}/53 — 9:52以降に再判定推奨")
-        if f["spread_entry"] > 0.4:
-            res["warnings"].append(f"スプレッド {f['spread_entry']:.2f}pips > 0.4（過去実績 勝率37%）")
-    else:
-        f = compute_features(bars, ti, "09:25:00")
-        res["day_type"] = "非ゴトー日"
-        res["logic"] = "L2 仲値前ロング"
-        res["plan"] = "9:25 成行ロング → 9:55（仲値）決済"
-        tier, v, note = judge_l2(f, dow)
-        res.update(tier=tier, detail=note)
-        if v is not None:
-            res["score"] = f"n_ret79 = {v}"
-    res["features"] = {k: (None if isinstance(v, float) and math.isnan(v) else round(v, 4))
-                       for k, v in f.items() if k != "last_bar"}
+        res["logic"] = "L1 ゴトー日仲値ショート（3バリアント）"
+        if bars_usd is None:
+            bars_usd = load_bars(target, "USD_JPY")
+        if bars_eur is None:
+            bars_eur = load_bars(target, "EUR_JPY")
+        variants = []
+        f_by_sym = {}
+        for var in L1_VARIANTS:
+            bars = bars_usd if var["symbol"] == "USD_JPY" else bars_eur
+            try:
+                if var["symbol"] not in f_by_sym:
+                    f_by_sym[var["symbol"]] = compute_features(bars, ti, "09:53:00")
+                variants.append(judge_l1_variant(var, f_by_sym[var["symbol"]], target.month))
+            except ValueError as e:
+                variants.append({"key": var["key"], "name": var["name"], "plan": var["plan"],
+                                 "tier": "判定不能", "detail": str(e), "warnings": []})
+        res["variants"] = variants
+        ok = [v for v in variants if "data_last_bar" in v]
+        if ok:
+            res["data_last_bar"] = ok[0]["data_last_bar"]
+        return res
+
+    if bars_usd is None:
+        bars_usd = load_bars(target, "USD_JPY")
+    f = compute_features(bars_usd, ti, "09:25:00")
+    res["day_type"] = "非ゴトー日"
+    res["logic"] = "L2 仲値前ロング (USDJPY)"
+    res["plan"] = "9:25 成行ロング → 9:55（仲値）決済"
+    tier, v, note = judge_l2(f, dow)
+    res.update(tier=tier, detail=note)
+    if v is not None:
+        res["score"] = f"n_ret79 = {v}"
+    res["features"] = _clean(f)
     res["data_last_bar"] = f["last_bar"]
     res["price"] = {"bid": f["entry_bid"], "ask": f["entry_ask"]}
     return res
